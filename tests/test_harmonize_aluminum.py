@@ -274,5 +274,59 @@ class HarmonizeAluminumCliTests(unittest.TestCase):
         np.testing.assert_array_equal(result, a)
 
 
+    def test_cancelled_protection_cannot_silently_remain_frozen(self):
+        required = np.zeros((176, 112), dtype=np.uint8)
+        required[85:90, 50:55] = 255  # Overlaps an obsolete frozen label/band.
+        path = self.root / 'required.png'
+        Image.fromarray(required).save(path)
+        self.job['views'][0]['required_editable_mask'] = str(path)
+        result = self.invoke()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Required editable pixels remain protected', result.stderr)
+        self.assertFalse((self.root / 'photos' / 'test-face.png').exists())
+        self.assertEqual(sha256(self.source), self.original_hash)
+
+    def test_required_editable_domain_gap_is_rejected(self):
+        required = np.zeros((176, 112), dtype=np.uint8)
+        required[6, 50] = 255  # Visible pixel outside the reviewed material domain.
+        path = self.root / 'required.png'
+        Image.fromarray(required).save(path)
+        self.job['views'][0]['required_editable_mask'] = str(path)
+        result = self.invoke()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Required editable pixels missing', result.stderr)
+        self.assertFalse((self.root / 'photos' / 'test-face.png').exists())
+
+    def test_fit_exclusion_remains_editable_and_is_reported(self):
+        required = np.zeros((176, 112), dtype=np.uint8)
+        required[40:50, 25:35] = 255
+        path = self.root / 'required.png'
+        Image.fromarray(required).save(path)
+        view = self.job['views'][0]
+        view['required_editable_mask'] = str(path)
+        view['exclude_from_fit'] = [{'type': 'rectangle', 'xy': [23, 38, 36, 51]}]
+        self.assert_success(self.invoke())
+        report = json.loads((self.root / 'records' / 'validation.json').read_text())['views']['test-face']
+        self.assertEqual(report['required_editable_pixels'], 100)
+        self.assertEqual(report['required_editable_missing'], 0)
+        result = np.array(Image.open(self.root / 'photos' / 'test-face.png'))
+        self.assertTrue(np.any(result[required > 0] != self.original[required > 0]))
+
+    def test_zero_feather_corrects_visible_edge_without_residual_protection_band(self):
+        a = np.full((60, 60, 4), 255, dtype=np.uint8)
+        a[..., :3] = [120, 125, 130]
+        a[:, :4, 3] = 0
+        a[:, 4, 3] = 128
+        Image.fromarray(a).save(self.source)
+        item = {'source': str(self.source), 'domains': [
+            {'shapes': [{'type': 'rectangle', 'xy': [4, 0, 59, 59]}], 'feather': 0}]}
+        target = MODULE.rgb_to_lab(np.array([160, 165, 170]))
+        result, _, _, _ = MODULE.process_view(item, target, {})
+        np.testing.assert_array_equal(result[:, 4, :3], result[:, 20, :3])
+        self.assertGreater(int(result[30, 4, 0]), 120)
+        np.testing.assert_array_equal(result[..., 3], a[..., 3])
+        np.testing.assert_array_equal(result[:, :4], a[:, :4])
+
+
 if __name__ == '__main__':
     unittest.main()

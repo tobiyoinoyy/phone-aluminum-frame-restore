@@ -112,6 +112,10 @@ def shapes_mask(size, shapes):
 
 def inward_weight(mask, radius):
     """Discrete interior distance ramp, exactly zero outside reviewed mask."""
+    if radius < 0:
+        raise ValueError('Feather radius must be nonnegative')
+    if radius == 0:
+        return mask.astype(float)
     steps = max(1, int(radius))
     im = Image.fromarray(mask.astype(np.uint8)*255)
     total = mask.astype(float)
@@ -174,6 +178,14 @@ def process_view(item, target, defaults):
         if external.shape != (h,w):
             raise ValueError('Editable mask dimensions differ from source')
         reviewed = external > 0
+    required = np.zeros((h,w), dtype=bool)
+    if item.get('required_editable_mask'):
+        external = np.array(Image.open(item['required_editable_mask']).convert('L'))
+        if external.shape != (h,w):
+            raise ValueError('Required editable mask dimensions differ from source')
+        required = (external > 0) & (src[...,3] > 0)
+        if np.any(required & protect):
+            raise ValueError('Required editable pixels remain protected; revise obsolete protection')
     exclude = shapes_mask((w,h), item.get('exclude_from_fit', [])) | protect
     lab = rgb_to_lab(src[...,:3])
     mode = color_mode(defaults)
@@ -209,6 +221,8 @@ def process_view(item, target, defaults):
         out_lab += shift*weight[...,None]
         domains.append({'name':domain.get('name','metal'), 'editable_pixels':int(allowed.sum()),
                         'fit_pixels':int(fit.sum()),'strength':strengths.tolist()})
+    if np.any(required & ~allowed_union):
+        raise ValueError('Required editable pixels missing from material domains or editable mask')
     gamut_limited = 0
     if mode == 'source_lightness':
         threshold = np.asarray(defaults.get('lightness_deadband', [0, 0]), dtype=float)
@@ -232,6 +246,8 @@ def process_view(item, target, defaults):
     return dst, allowed_union, protect, {'source':str(path),'source_sha256':before_hash,
         'size':[w,h], 'domains':domains, 'color_mode':mode,
         'gamut_limited_pixels':gamut_limited,
+        'required_editable_pixels':int(required.sum()),
+        'required_editable_missing':0,
         'changed_pixels':int(np.any(dst != src,axis=-1).sum()),
         'alpha_changed':0,'protected_changed':0,'outside_changed':0}
 
