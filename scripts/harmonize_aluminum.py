@@ -29,7 +29,7 @@ def rgb_to_lab(rgb):
                      200*(f[...,1]-f[...,2])], axis=-1)
 
 
-def lab_to_rgb(lab):
+def lab_to_linear_rgb(lab):
     fy = (lab[...,0]+16)/116
     f = np.stack([fy+lab[...,1]/500, fy, fy-lab[...,2]/200], axis=-1)
     xyz = np.where(f > 6/29, f**3, 3*(6/29)**2*(f-4/29))
@@ -37,9 +37,43 @@ def lab_to_rgb(lab):
     lin = np.einsum('...j,ij->...i', xyz, np.linalg.inv(np.array([[.4124564,.3575761,.1804375],
                                       [.2126729,.7151522,.0721750],
                                       [.0193339,.1191920,.9503041]])))
-    lin = np.maximum(lin, 0)
+    return lin
+
+
+def lab_to_rgb(lab):
+    lin = np.maximum(lab_to_linear_rgb(lab), 0)
     srgb = np.where(lin <= .0031308, lin*12.92, 1.055*lin**(1/2.4)-.055)
     return np.clip(np.rint(srgb*255), 0, 255).astype(np.uint8)
+
+
+def preserve_chroma_in_gamut(desired, source):
+    """Limit only L displacement; source a/b remain unchanged in float Lab."""
+    result = np.array(desired, dtype=float, copy=True)
+    result[..., 1:] = source[..., 1:]
+    linear = lab_to_linear_rgb(result)
+    bad = np.any((linear < -1e-7) | (linear > 1+1e-7), axis=-1)
+    if bad.any():
+        src, dst = source[bad], result[bad]
+        delta = dst[..., 0] - src[..., 0]
+        lo, hi = np.zeros(len(src)), np.ones(len(src))
+        for _ in range(24):
+            mid = (lo+hi)/2
+            trial = dst.copy()
+            trial[..., 0] = src[..., 0] + delta*mid
+            rgb = lab_to_linear_rgb(trial)
+            valid = np.all((rgb >= -1e-7) & (rgb <= 1+1e-7), axis=-1)
+            lo = np.where(valid, mid, lo)
+            hi = np.where(valid, hi, mid)
+        dst[..., 0] = src[..., 0] + delta*lo
+        result[bad] = dst
+    return result, int(bad.sum())
+
+
+def color_mode(config):
+    mode = config.get('color_mode', 'source_lightness')
+    if mode not in ('source_lightness', 'shared_color'):
+        raise ValueError('Unknown color_mode: '+str(mode))
+    return mode
 
 
 def gaussian(arr, sigma):
@@ -142,6 +176,7 @@ def process_view(item, target, defaults):
         reviewed = external > 0
     exclude = shapes_mask((w,h), item.get('exclude_from_fit', [])) | protect
     lab = rgb_to_lab(src[...,:3])
+    mode = color_mode(defaults)
     out_lab = lab.copy()
     allowed_union = np.zeros((h,w), dtype=bool)
     domains = []
@@ -161,6 +196,9 @@ def process_view(item, target, defaults):
                         for c in range(3)], axis=-1)
         low[support < 1e-5] = fallback
         strengths = np.array(domain.get('strength', defaults.get('strength', [.78,.72,.72])))
+        if mode == 'source_lightness':
+            strengths = strengths.copy()
+            strengths[1:] = 0
         shift = (target-low)*strengths
         limits = np.array(defaults.get('max_lab_shift', [48,24,24]))
         shift = np.clip(shift, -limits, limits)
@@ -171,6 +209,18 @@ def process_view(item, target, defaults):
         out_lab += shift*weight[...,None]
         domains.append({'name':domain.get('name','metal'), 'editable_pixels':int(allowed.sum()),
                         'fit_pixels':int(fit.sum()),'strength':strengths.tolist()})
+    gamut_limited = 0
+    if mode == 'source_lightness':
+        threshold = np.asarray(defaults.get('lightness_deadband', [0, 0]), dtype=float)
+        if (threshold.shape != (2,) or not np.isfinite(threshold).all()
+                or threshold[0] < 0 or threshold[1] < threshold[0]
+                or (threshold[1] > 0 and threshold[1] == threshold[0])):
+            raise ValueError('lightness_deadband needs 0 <= start < end, or [0, 0]')
+        if threshold[1] > 0:
+            delta = out_lab[..., 0]-lab[..., 0]
+            t = np.clip((np.abs(delta)-threshold[0])/(threshold[1]-threshold[0]), 0, 1)
+            out_lab[..., 0] = lab[..., 0]+delta*t*t*(3-2*t)
+        out_lab, gamut_limited = preserve_chroma_in_gamut(out_lab, lab)
     dst = src.copy()
     converted = lab_to_rgb(out_lab)
     dst[allowed_union,:3] = converted[allowed_union]
@@ -180,7 +230,8 @@ def process_view(item, target, defaults):
     if digest(path) != before_hash:
         raise RuntimeError('Source changed during processing')
     return dst, allowed_union, protect, {'source':str(path),'source_sha256':before_hash,
-        'size':[w,h], 'domains':domains,
+        'size':[w,h], 'domains':domains, 'color_mode':mode,
+        'gamut_limited_pixels':gamut_limited,
         'changed_pixels':int(np.any(dst != src,axis=-1).sum()),
         'alpha_changed':0,'protected_changed':0,'outside_changed':0}
 
@@ -201,10 +252,21 @@ def run(job_path):
         raise ValueError('Records must live outside the photo delivery directory')
     output.mkdir(parents=True, exist_ok=True)
     records.mkdir(parents=True, exist_ok=True)
-    target, info = target_color(job)
+    mode = color_mode(job)
+    defaults = dict(job.get('defaults', {}), color_mode=mode)
+    if mode == 'source_lightness':
+        if 'target_lab' in job or 'ai_reference' in job:
+            raise ValueError('Shared color targets require explicit color_mode shared_color')
+        targets = [target_color({'views': [item]}) for item in job['views']]
+        info = {'mode': mode, 'per_view_source_references': {
+            item['name']: entry[1] for item, entry in zip(job['views'], targets)}}
+    else:
+        target, info = target_color(job)
+        targets = [(target, info)]*len(job['views'])
+        info['mode'] = mode
     report = {'target':info, 'uv_seam_validation':'not_performed_without_uv_correspondence', 'views':{}}
-    for item, dest in zip(job['views'], outputs):
-        dst, allowed, protect, details = process_view(item,target,job.get('defaults',{}))
+    for item, dest, (target, _) in zip(job['views'], outputs, targets):
+        dst, allowed, protect, details = process_view(item,target,defaults)
         src_im = Image.open(item['source'])
         save_args = {'icc_profile':src_im.info['icc_profile']} if 'icc_profile' in src_im.info else {}
         Image.fromarray(dst).save(dest, **save_args)

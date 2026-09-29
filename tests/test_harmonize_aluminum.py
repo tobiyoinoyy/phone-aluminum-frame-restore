@@ -201,5 +201,78 @@ class HarmonizeAluminumCliTests(unittest.TestCase):
         self.assertFalse((self.root / 'photos').exists())
 
 
+    def test_default_uses_per_face_lightness_and_keeps_source_chroma(self):
+        second = self.root / 'second.png'
+        a = np.zeros((80, 80, 4), dtype=np.uint8)
+        a[:] = [205, 218, 225, 255]
+        b = a.copy()
+        b[..., :3] = [180, 172, 167]
+        Image.fromarray(a).save(self.source)
+        Image.fromarray(b).save(second)
+        self.job['views'] = [
+            {'name': name, 'source': str(path), 'reference_boxes': [[10, 10, 30, 30]],
+             'domains': [{'shapes': [{'type': 'rectangle', 'xy': [0, 0, 79, 79]}]}]}
+            for name, path in [('cool', self.source), ('warm', second)]]
+        self.assert_success(self.invoke())
+        for name, original in [('cool', a), ('warm', b)]:
+            result = np.array(Image.open(self.root / 'photos' / (name+'.png')))
+            # Pooling colors or L references would change these correctly lit faces.
+            np.testing.assert_array_equal(result, original)
+
+    def test_gamut_limit_reduces_l_shift_without_chroma_replacement(self):
+        source = MODULE.rgb_to_lab(np.array([[230, 100, 35], [20, 55, 220]]))
+        desired = source.copy()
+        desired[:, 0] = [98, 95]
+        limited, count = MODULE.preserve_chroma_in_gamut(desired, source)
+        self.assertEqual(count, 2)
+        np.testing.assert_array_equal(limited[:, 1:], source[:, 1:])
+        self.assertTrue(np.all(limited[:, 0] > source[:, 0]))
+        self.assertTrue(np.all(limited[:, 0] < desired[:, 0]))
+        linear = MODULE.lab_to_linear_rgb(limited)
+        self.assertGreaterEqual(linear.min(), -1.1e-7)
+        self.assertLessEqual(linear.max(), 1+1.1e-7)
+        saved = MODULE.rgb_to_lab(MODULE.lab_to_rgb(limited))
+        self.assertLess(np.max(np.abs(saved[:, 1:]-source[:, 1:])), .8)
+
+    def test_shared_color_requires_explicit_mode_and_remains_available(self):
+        self.job['target_lab'] = [70, 0, 0]
+        result = self.invoke()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('require explicit color_mode shared_color', result.stderr)
+        self.job['color_mode'] = 'shared_color'
+        self.assert_success(self.invoke())
+        report = json.loads((self.root / 'records' / 'validation.json').read_text())
+        self.assertEqual(report['target']['mode'], 'shared_color')
+        self.assertEqual(report['target']['target_lab'], [70, 0, 0])
+
+    def test_complete_button_fit_exclusion_avoids_invented_halo(self):
+        a = np.full((100, 100, 4), 255, dtype=np.uint8)
+        a[..., :3] = [200, 210, 215]
+        a[35:65, 40:60, :3] = [60, 65, 70]
+        Image.fromarray(a).save(self.source)
+        button = {'type': 'rectangle', 'xy': [35, 30, 64, 69]}
+        item = {'source': str(self.source), 'exclude_from_fit': [button],
+                'domains': [{'shapes': [{'type': 'rectangle', 'xy': [0, 0, 99, 99]}]}]}
+        target = MODULE.rgb_to_lab(np.array([200, 210, 215]))
+        result, allowed, _, _ = MODULE.process_view(item, target, {'sigma': [12, 12]})
+        # Excluded pixels remain editable, but the dark button cannot lift adjacent metal.
+        self.assertTrue(allowed[50, 50])
+        np.testing.assert_array_equal(result, a)
+        item.pop('exclude_from_fit')
+        contaminated, _, _, _ = MODULE.process_view(item, target, {'sigma': [12, 12]})
+        self.assertGreater(int(contaminated[50, 65, 0]), int(a[50, 65, 0]))
+
+    def test_lightness_deadband_leaves_stable_exposure_unchanged(self):
+        a = np.full((60, 60, 4), 255, dtype=np.uint8)
+        a[..., :3] = [200, 210, 215]
+        Image.fromarray(a).save(self.source)
+        item = {'source': str(self.source), 'domains': [
+            {'shapes': [{'type': 'rectangle', 'xy': [0, 0, 59, 59]}]}]}
+        target = MODULE.rgb_to_lab(np.array([200, 210, 215]))
+        target[0] += 1
+        result, _, _, _ = MODULE.process_view(item, target, {'lightness_deadband': [1, 3]})
+        np.testing.assert_array_equal(result, a)
+
+
 if __name__ == '__main__':
     unittest.main()
