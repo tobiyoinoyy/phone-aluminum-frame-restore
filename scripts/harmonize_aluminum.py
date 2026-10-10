@@ -110,6 +110,59 @@ def shapes_mask(size, shapes):
     return np.array(im) > 0
 
 
+def supported_field(lab, fit, editable, sigma):
+    """Never extrapolate an unsupported editable component from another surface.
+
+    Shared by CLI and custom batch scripts. The fixed floor is a numerical
+    guard, not a guarantee that the selected samples are the right material.
+    Values outside reliable support are zero and must not enter smoothing.
+    """
+    support = gaussian(fit.astype(float), sigma)
+    reliable = support >= .008
+    missing = editable & ~reliable
+    if missing.any():
+        y, x = np.nonzero(missing)
+        raise ValueError(f'Unsupported editable illumination: {len(x)} pixels; '
+                         f'bounds [{x.min()}, {y.min()}, {x.max()}, {y.max()}]. '
+                         'Split the component and fit its own reviewed source samples; '
+                         'nearest-neighbor or median hole filling is not permitted.')
+    low = np.stack([gaussian(lab[..., c]*fit, sigma)/np.maximum(support, 1e-9)
+                    for c in range(3)], axis=-1)
+    low[~reliable] = 0
+    return low, support, reliable
+
+
+def component_offset(source, accepted, component, reference, feather=2):
+    """Repair one reviewed component from source texture with a constant Lab offset.
+
+    The accepted image supplies color only in explicitly reviewed stable samples.
+    It supplies no texture inside the repair. Outside the component is exact.
+    """
+    if source.shape != accepted.shape or source.ndim != 3 or source.shape[2] != 4:
+        raise ValueError('Source and accepted image must have matching RGBA geometry')
+    if not np.array_equal(source[..., 3], accepted[..., 3]):
+        raise ValueError('Source and accepted alpha differ')
+    component = np.asarray(component, dtype=bool)
+    reference = np.asarray(reference, dtype=bool)
+    if component.shape != source.shape[:2] or reference.shape != component.shape:
+        raise ValueError('Component masks must match source dimensions')
+    if np.any(component & (source[..., 3] == 0)) or np.any(reference & ~component):
+        raise ValueError('References must be inside the visible reviewed component')
+    if reference.sum() < 20:
+        raise ValueError('Insufficient reviewed component reference samples')
+    lab = rgb_to_lab(source[..., :3])
+    delta = np.median((rgb_to_lab(accepted[..., :3])-lab)[reference], axis=0)
+    corrected = lab_to_rgb(lab + delta)
+    weight = inward_weight(component, feather)
+    dst = accepted.copy()
+    mixed = np.clip(np.rint(corrected*weight[..., None]
+                    + accepted[..., :3]*(1-weight[..., None])), 0, 255).astype(np.uint8)
+    dst[component, :3] = mixed[component]
+    return dst, {'method': 'source_texture_constant_component_lab_offset',
+                 'offset_lab': delta.tolist(), 'reference_pixels': int(reference.sum()),
+                 'component_pixels': int(component.sum()), 'feather': feather}
+
+
 def inward_weight(mask, radius):
     """Discrete interior distance ramp, exactly zero outside reviewed mask."""
     if radius < 0:
@@ -202,11 +255,7 @@ def process_view(item, target, defaults):
         if fit.sum() < 20:
             raise ValueError('Insufficient reviewed material samples')
         sigma = domain.get('sigma', defaults.get('sigma', [18,18]))
-        support = gaussian(fit.astype(float), sigma)
-        fallback = np.median(lab[fit], axis=0)
-        low = np.stack([gaussian(lab[...,c]*fit, sigma)/np.maximum(support,1e-9)
-                        for c in range(3)], axis=-1)
-        low[support < 1e-5] = fallback
+        low, support, reliable = supported_field(lab, fit, allowed, sigma)
         strengths = np.array(domain.get('strength', defaults.get('strength', [.78,.72,.72])))
         if mode == 'source_lightness':
             strengths = strengths.copy()
@@ -216,11 +265,15 @@ def process_view(item, target, defaults):
         shift = np.clip(shift, -limits, limits)
         # Smooth all correction components, including across excluded features.
         # Protected pixels themselves are reinstated exactly after conversion.
-        shift = gaussian(shift, domain.get('correction_smooth', 3))
+        smooth = domain.get('correction_smooth', 3)
+        shift = (gaussian(shift*reliable[..., None], smooth)
+                 / np.maximum(gaussian(reliable.astype(float), smooth)[..., None], 1e-9))
         weight = inward_weight(allowed, domain.get('feather', defaults.get('feather', 5)))
         out_lab += shift*weight[...,None]
         domains.append({'name':domain.get('name','metal'), 'editable_pixels':int(allowed.sum()),
-                        'fit_pixels':int(fit.sum()),'strength':strengths.tolist()})
+                        'fit_pixels':int(fit.sum()),'strength':strengths.tolist(),
+                        'minimum_editable_support':float(support[allowed].min()) if allowed.any() else None,
+                        'unsupported_editable_pixels':0})
     if np.any(required & ~allowed_union):
         raise ValueError('Required editable pixels missing from material domains or editable mask')
     gamut_limited = 0

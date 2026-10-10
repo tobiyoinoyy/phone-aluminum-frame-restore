@@ -262,6 +262,59 @@ class HarmonizeAluminumCliTests(unittest.TestCase):
         contaminated, _, _, _ = MODULE.process_view(item, target, {'sigma': [12, 12]})
         self.assertGreater(int(contaminated[50, 65, 0]), int(a[50, 65, 0]))
 
+    def test_excluded_long_button_without_support_fails_before_delivery(self):
+        # Narrow transverse blur cannot bridge a fully excluded long button.
+        self.job['defaults']['sigma'] = [10, 2]
+        self.job['views'][0]['exclude_from_fit'] = [
+            {'type': 'rectangle', 'xy': [30, 28, 80, 146]}]
+        result = self.invoke()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Unsupported editable illumination', result.stderr)
+        self.assertFalse((self.root/'photos/test-face.png').exists())
+        self.assertEqual(sha256(self.source), self.original_hash)
+
+    def test_button_own_domain_has_support_and_no_frame_color_contamination(self):
+        a = np.full((180, 90, 4), 255, dtype=np.uint8)
+        a[..., :3] = [180, 200, 220]
+        a[20:160, 30:60, :3] = [30, 60, 95]
+        Image.fromarray(a).save(self.source)
+        item = {'source': str(self.source), 'domains': [
+            {'name': 'button', 'shapes': [{'type':'rectangle','xy':[30,20,59,159]}]}]}
+        target = MODULE.rgb_to_lab(np.array([30, 60, 95]))
+        result, _, _, report = MODULE.process_view(item,target,{'sigma':[10,2]})
+        np.testing.assert_array_equal(result,a)
+        self.assertEqual(report['domains'][0]['unsupported_editable_pixels'],0)
+
+    def test_component_repair_removes_false_patch_keeps_texture_and_outside_exact(self):
+        yy,xx=np.indices((180,90))
+        source=np.full((180,90,4),255,dtype=np.uint8)
+        grain=np.where((yy+xx)%2,2,-2)
+        source[...,:3]=np.array([32,61,91])+grain[...,None]
+        component=(yy>=20)&(yy<160)&(xx>=30)&(xx<60)
+        accepted=source.copy()
+        accepted[component,:3]+=np.uint8(3)
+        bad=component&(yy>65)&(yy<115)
+        accepted[bad,:3]-=np.uint8(18)
+        refs=component&(yy>25)&(yy<50)
+        repaired,report=MODULE.component_offset(source,accepted,component,refs,feather=0)
+        np.testing.assert_array_equal(repaired[~component],accepted[~component])
+        np.testing.assert_array_equal(repaired[...,3],source[...,3])
+        np.testing.assert_array_equal(repaired[bad,:3],source[bad,:3]+3)
+        np.testing.assert_array_equal(repaired[refs,:3],accepted[refs,:3])
+        self.assertEqual(report['method'],'source_texture_constant_component_lab_offset')
+        with self.assertRaisesRegex(ValueError,'inside the visible reviewed component'):
+            MODULE.component_offset(source,accepted,component,~component)
+
+    def test_unsupported_protected_hole_cannot_leak_fallback_into_editable_pixels(self):
+        a=np.full((180,90,4),255,dtype=np.uint8);a[...,:3]=[160,170,180]
+        a[30:150,30:60,:3]=[1,1,1]
+        Image.fromarray(a).save(self.source)
+        item={'source':str(self.source),'protect':[{'type':'rectangle','xy':[30,30,59,149]}],
+              'domains':[{'shapes':[{'type':'rectangle','xy':[0,0,89,179]}]}]}
+        result,_,_,_=MODULE.process_view(item,MODULE.rgb_to_lab(np.array([160,170,180])),
+                                         {'sigma':[10,2]})
+        np.testing.assert_array_equal(result,a)
+
     def test_lightness_deadband_leaves_stable_exposure_unchanged(self):
         a = np.full((60, 60, 4), 255, dtype=np.uint8)
         a[..., :3] = [200, 210, 215]
