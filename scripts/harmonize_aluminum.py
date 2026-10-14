@@ -214,6 +214,36 @@ def target_color(job):
     return target, info
 
 
+def supported_contour_field(lab, fit, editable, alpha, sigma):
+    """Tangent/normal source sampling; include curved rims and alpha fringes.
+
+    Requires SciPy (included by phone-texture-preprocessor). No nearest-neighbor
+    fill or lowering support threshold when a material is not represented.
+    """
+    from scipy.ndimage import distance_transform_edt, gaussian_filter, map_coordinates
+    tangent, normal = np.asarray(sigma,dtype=float)
+    if not np.isfinite([tangent,normal]).all() or tangent<=0 or normal<=0:
+        raise ValueError('Contour sigma must be two finite positive values')
+    inside=alpha>=128
+    dist=distance_transform_edt(np.pad(inside,1))[1:-1,1:-1]-distance_transform_edt(~inside)
+    gy,gx=np.gradient(gaussian_filter(dist,3));norm=np.maximum(np.hypot(gx,gy),1e-8)
+    nx,ny=gx/norm,gy/norm;y,x=np.nonzero(editable)
+    num=np.zeros((len(x),3));den=np.zeros(len(x));total=0.
+    for t in np.linspace(-2.5*tangent,2.5*tangent,19):
+        for n in np.linspace(-2*normal,2*normal,5):
+            inset=np.maximum(0,5-dist[y,x])
+            coordinates=[y+nx[y,x]*t+ny[y,x]*(n+inset),x-ny[y,x]*t+nx[y,x]*(n+inset)]
+            weight=np.exp(-.5*(t/tangent)**2-.5*(n/normal)**2);total+=weight
+            den+=weight*map_coordinates(fit.astype(float),coordinates,order=1,mode='constant',cval=0)
+            for channel in range(3):
+                num[:,channel]+=weight*map_coordinates(lab[...,channel]*fit,coordinates,order=1,mode='constant',cval=0)
+    strength=den/total
+    if (strength<.008).any():raise ValueError('Unsupported editable contour illumination')
+    if not np.isfinite(num).all():raise ValueError('Non-finite contour illumination')
+    low=np.zeros_like(lab);support=np.zeros(alpha.shape);low[y,x]=num/den[:,None];support[y,x]=strength
+    return low,support,support>=.008
+
+
 def process_view(item, target, defaults):
     path = Path(item['source'])
     before_hash = digest(path)
@@ -225,6 +255,17 @@ def process_view(item, target, defaults):
         if external.shape != (h,w):
             raise ValueError('Protection mask dimensions differ from source')
         protect |= external > 0
+    if item.get('protection_policy', 'reviewed_regions') not in ('sticker_only','reviewed_regions'):
+        raise ValueError('Unknown protection policy')
+    if item.get('protection_policy') == 'sticker_only':
+        if item.get('source_sha256') != before_hash or not item.get('sticker_mask'):
+            raise ValueError('Sticker-only policy requires source SHA256 and sticker mask')
+        paper = np.array(Image.open(item['sticker_mask']).convert('L')) > 0
+        if paper.shape != (h,w):
+            raise ValueError('Sticker mask dimensions differ')
+        visible = src[...,3] > 0
+        if np.any((protect ^ paper) & visible):
+            raise ValueError('Sticker-only policy rejects protection outside actual paper or unprotected paper')
     reviewed = np.ones((h,w), dtype=bool)
     if item.get('editable_mask'):
         external = np.array(Image.open(item['editable_mask']).convert('L'))
@@ -255,7 +296,13 @@ def process_view(item, target, defaults):
         if fit.sum() < 20:
             raise ValueError('Insufficient reviewed material samples')
         sigma = domain.get('sigma', defaults.get('sigma', [18,18]))
-        low, support, reliable = supported_field(lab, fit, allowed, sigma)
+        field = domain.get('field','gaussian')
+        if field == 'contour':
+            low, support, reliable = supported_contour_field(lab, fit, allowed, src[...,3], sigma)
+        elif field == 'gaussian':
+            low, support, reliable = supported_field(lab, fit, allowed, sigma)
+        else:
+            raise ValueError('Unknown illumination field')
         strengths = np.array(domain.get('strength', defaults.get('strength', [.78,.72,.72])))
         if mode == 'source_lightness':
             strengths = strengths.copy()
@@ -271,7 +318,7 @@ def process_view(item, target, defaults):
         weight = inward_weight(allowed, domain.get('feather', defaults.get('feather', 5)))
         out_lab += shift*weight[...,None]
         domains.append({'name':domain.get('name','metal'), 'editable_pixels':int(allowed.sum()),
-                        'fit_pixels':int(fit.sum()),'strength':strengths.tolist(),
+                        'fit_pixels':int(fit.sum()),'field':field,'strength':strengths.tolist(),
                         'minimum_editable_support':float(support[allowed].min()) if allowed.any() else None,
                         'unsupported_editable_pixels':0})
     if np.any(required & ~allowed_union):

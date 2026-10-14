@@ -383,3 +383,29 @@ class HarmonizeAluminumCliTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class StickerOnlyPolicyTests(unittest.TestCase):
+    def test_nonpaper_protection_rejected_before_processing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);src=root/'source.png';paper=root/'paper.png';prot=root/'prot.png'
+            Image.new('RGBA',(20,20),(210,120,70,255)).save(src)
+            mask=np.zeros((20,20),np.uint8);mask[10:17,8:12]=255
+            Image.fromarray(mask).save(paper);Image.fromarray(mask).save(prot)
+            item=dict(source=str(src),source_sha256=sha256(src),domains=[],
+                      protection_policy='sticker_only',sticker_mask=str(paper),protected_mask=str(prot))
+            MODULE.process_view(item,np.array([65,20,30]),{})
+            mask[3,1:7]=255;Image.fromarray(mask).save(prot)
+            with self.assertRaisesRegex(ValueError,'Sticker-only policy rejects'):
+                MODULE.process_view(item,np.array([65,20,30]),{})
+
+class ContourFieldTests(unittest.TestCase):
+    def test_narrow_visible_rim_has_supported_source_field(self):
+        alpha=np.zeros((80,40),np.uint8);alpha[5:75,5:35]=255;alpha[5:75,4]=100
+        fit=alpha>=240;editable=(alpha>0)&(np.indices(alpha.shape)[1]<12)
+        lab=np.zeros((80,40,3));lab[:]=[65,22,30]
+        low,support,reliable=MODULE.supported_contour_field(lab,fit,editable,alpha,[8,1.2])
+        self.assertTrue(np.allclose(low[editable],[65,22,30]))
+        self.assertGreaterEqual(float(support[editable].min()),.008)
+        self.assertTrue(reliable[editable].all())
+        with self.assertRaisesRegex(ValueError,'Unsupported'):
+            MODULE.supported_contour_field(lab,np.zeros_like(fit),editable,alpha,[8,1.2])
